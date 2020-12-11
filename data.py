@@ -39,6 +39,7 @@ class Batch:
     targets: torch.sparse.LongTensor
     x_mapper_sparse: torch.sparse.LongTensor
     neighbor_mapper_sparse: torch.sparse.LongTensor
+    ignore_index: int
 
 
 @dataclasses.dataclass
@@ -81,6 +82,24 @@ def align_wordpieces(
 
     assert word_index == len(words)
     return results
+
+
+def _iter_minibatches(
+    instances: List[Instance], batch_size: int
+) -> Iterator[Tuple[List[Instance], Tuple[int, int]]]:
+    buffer_ = []
+    curr_len = len(instances[0])
+    start = 0
+    for batch_index, instance in enumerate(instances):
+        if len(instance) != curr_len or batch_index - start == batch_size:
+            yield buffer_, (start, batch_index)
+            buffer_ = []
+            curr_len = len(instance)
+            start = batch_index
+        else:
+            buffer_.append(instance)
+    if buffer_:
+        yield buffer_, (start, len(instances))
 
 
 class SentDB(object):
@@ -202,13 +221,10 @@ class SentDB(object):
 
         results = []
 
-        for batch_index in range(0, len(instances), batch_size):
+        for batch_instances, _ in _iter_minibatches(instances, batch_size):
             # batch_size x max_wordpieces
             batch = torch.nn.utils.rnn.pad_sequence(
-                [
-                    torch.LongTensor(instance.wordpieces)
-                    for instance in instances[batch_index : batch_index + batch_size]
-                ],
+                [torch.LongTensor(instance.wordpieces) for instance in batch_instances],
                 padding_value=0,
                 batch_first=True,
             )
@@ -253,33 +269,57 @@ class SentDB(object):
         _, results = torch.topk(similarities, topk, dim=1)
         self.validation_top_neighbors = [row.tolist() for row in results]
 
-    def train_batch(self, batch_index: int, padding_value: int = 0):
+    def pred_batch(
+        self,
+        batch_or_sent_index: int,
+        num_neighbors: Optional[int] = None,
+        padding_value: int = 0,
+        batch_prediction: bool = True,
+        validation: bool = False,
+    ):
+        """
+        make a validation minibatch for actually predicting.
+        N.B. only uses validation minibatches
+        """
 
-        batch = self.train_minibatches[batch_index]
+        if validation:
+            instances = self.validation_instances
 
-        if isinstance(batch, RandomBatch):
+            if batch_prediction:
+                batch = self.validation_minibatches[batch_or_sent_index]
+            else:
+                assert num_neighbors is not None
 
-            batch = self.precompute_batch(
-                batch.start_index,
-                batch.end_index,
-                batch.num_neighbors,
-                random_neighbors=True,
-                validation=False,
-            )
+                batch = self.precompute_batch(
+                    batch_or_sent_index,
+                    batch_or_sent_index + 1,
+                    num_neighbors,
+                    validation=True,
+                )
+        else:
+            instances = self.train_instances
+            batch = self.train_minibatches[batch_or_sent_index]
 
-        #  batch_size x max_wordpieces
+            if isinstance(batch, RandomBatch):
+
+                batch = self.precompute_batch(
+                    batch.start_index,
+                    batch.end_index,
+                    batch.num_neighbors,
+                    random_neighbors=True,
+                    validation=False,
+                )
+
+        # batch_size x max_wordpieces
         x = torch.nn.utils.rnn.pad_sequence(
             [
                 torch.LongTensor(instance.wordpieces)
-                for instance in self.train_instances[
-                    batch.start_index : batch.end_index
-                ]
+                for instance in instances[batch.start_index : batch.end_index]
             ],
             padding_value=padding_value,
             batch_first=True,
         )
 
-        # num_neighbors x max_wordpieces
         neighbors = torch.nn.utils.rnn.pad_sequence(
             [
                 torch.LongTensor(self.train_instances[neighbor_index].wordpieces)
@@ -292,84 +332,39 @@ class SentDB(object):
         x_mapper = batch.x_mapper_sparse.to_dense()
         neighbor_mapper = batch.neighbor_mapper_sparse.to_dense()
 
-        max_neighbor_seq_len = max(
-            len(self.train_instances[neighbor_index].tags)
-            for neighbor_index in batch.neighbor_indices
-        )
+        if train:
 
-        # neighb targets are in format num_neighbors*max_ne_len, so add one more option for ignore
-        # TODO:aaaaaaaaaaaaaaaaaa
-        ignore_index = len(batch.neighbor_indices) * max_neighbor_seq_len
-        targets = batch.targets.to_dense()
-        return x, neighbors, x_mapper, neighbor_mapper, targets
-
-    def pred_batch(
-        self,
-        batch_or_sent_index: int,
-        num_neighbors: int,
-        padding_value: int = 0,
-        batch: bool = True,
-    ):
-        """
-        make a validation minibatch for actually predicting.
-        N.B. only uses validation minibatches
-        """
-
-        if batch:
-            batch = self.validation_minibatches[batch_or_sent_index]
-            start_index, end_index = batch.start_index, batch.end_index
-            x_mapper_sparse = batch.x_mapper_sparse
-        else:
-            start_index, end_index = batch_or_sent_index, batch_or_sent_index + 1
-            x_mapper_sparse = self._get_wordpiece_to_word_mapper(
-                [start_index], validation=True
+            sparse_targets = batch.targets
+            mask = (
+                torch.sparse_coo_tensor(
+                    sparse_targets._indices(),
+                    torch.ones_like(sparse_targets._values()),
+                    sparse_targets.size(),
+                )
+                .to_dense()
+                .bool()
             )
+            targets = sparse_targets.to_dense()
+            targets[~mask] = batch.ignore_index
 
-        # batch_size x max_wordpieces
-        x = torch.nn.utils.rnn.pad_sequence(
-            [
-                torch.LongTensor(instance.wordpieces)
-                for instance in self.validation_instances[start_index:end_index]
-            ],
-            padding_value=padding_value,
-            batch_first=True,
-        )
-
-        neighbors = torch.nn.utils.rnn.pad_sequence(
-            [
-                torch.LongTensor(self.train_instances[neighbor_index].wordpieces)
-                for neighbor_index in neighbor_indices
-            ],
-            padding_value=padding_value,
-            batch_first=True,
-        )
-
-        x_mapper = x_mapper_sparse.to_dense()
-        neighbor_mapper = self._get_wordpiece_to_word_mapper(
-            neighbor_indices
-        ).to_dense()
+            return x, neighbors, x_mapper, neighbor_mapper, targets
 
         gold_tags = [
             instance.tags
-            for instance in self.validation_instances[start_index:end_index]
+            for instance in self.validation_instances[
+                batch.start_index : batch.end_index
+            ]
         ]
 
-        neighbor_indices = self._compute_neighbor_indices(
-            start_index,
-            end_index,
-            num_neighbors,
-            random_neighbors=False,
-            validation=True,
-        )
-
         tag_to_neighbors = self._make_tag_to_neighbors_dict(
-            neighbor_indices, subsample=batch  # subsample when batch prediction
+            batch.neighbor_indices,
+            subsample=batch_prediction,  # subsample when batch prediction
         )
 
-        num_neighbors = len(neighbor_indices)
+        num_neighbors = len(batch.neighbor_indices)
         max_neighbor_seq_len = max(
             len(self.train_instances[neighbor_index].tags)
-            for neighbor_index in neighbor_indices
+            for neighbor_index in batch.neighbor_indices
         )
 
         tag_to_mask = []
@@ -390,30 +385,27 @@ class SentDB(object):
     def _make_tag_to_neighbors_dict(
         self, neighbor_indices: List[int], subsample: bool = True
     ) -> Dict[str, List[Tuple[int, int]]]:
+        """
+        map each tag to location in neighbors
+        """
 
-        # map each tag to location in neighbors
-        tag_to_neighbors = defaultdict(list)
+        results = defaultdict(list)
         for sentence_index, neighbor_index in enumerate(neighbor_indices):
             for token_index, tag in enumerate(
                 self.train_instances[neighbor_index].tags
             ):
-                tag_to_neighbors[tag].append((sentence_index, token_index))
+                results[tag].append((sentence_index, token_index))
 
         if subsample:
             keys = {"O"}
             if self.subsample is not None:
-                keys.update(tag_to_neighbors.keys())
+                keys.update(results.keys())
 
             for key in keys:
-                if (
-                    key in tag_to_neighbors
-                    and len(tag_to_neighbors[key]) > self.subsample
-                ):
-                    tag_to_neighbors[key] = random.sample(
-                        tag_to_neighbors[key], self.subsample
-                    )
+                if key in results and len(results[key]) > self.subsample:
+                    results[key] = random.sample(results[key], self.subsample)
 
-        return tag_to_neighbors
+        return results
 
     def _compute_neighbor_indices(
         self,
@@ -452,14 +444,13 @@ class SentDB(object):
 
         for tag, sent_indices in self.tag_to_train_sent_index.items():
             if tag not in neighbor_tags:
-                neighbor_indices.extend(
-                    random.sample(
+                neighbor_indices.append(
+                    random.choice(
                         [
                             sent_index
                             for sent_index in sent_indices
                             if sent_index not in seen_indices
                         ],
-                        1,
                     )
                 )
 
@@ -479,17 +470,12 @@ class SentDB(object):
             instances = self.train_instances
 
         minibatches = []
-        for batch_index in range(0, len(instances), batch_size):
+        for _, (start_index, end_index) in _iter_minibatches(instances, batch_size):
             if random_neighbors_in_train:
-                batch = RandomBatch(
-                    batch_index, batch_index + batch_size, num_neighbors
-                )
+                batch = RandomBatch(start_index, end_index, num_neighbors)
             else:
                 batch = self.precompute_batch(
-                    batch_index,
-                    batch_index + batch_size,
-                    num_neighbors,
-                    validation=validation,
+                    start_index, end_index, num_neighbors, validation=validation,
                 )
             minibatches.append(batch)
 
@@ -569,6 +555,7 @@ class SentDB(object):
             neighbor_indices, subsample=True
         )
 
+        batch_size = end_index - start_index
         max_seq_len = len(instances[start_index])
         max_neighbor_seq_len = max(
             len(self.train_instances[neighbor_index].tags)
@@ -579,15 +566,15 @@ class SentDB(object):
         max_correct = 0
         for batch_index, instance in enumerate(instances[start_index:end_index]):
             for word_index in range(max_seq_len):
-                true_tag = instance.tags[word_index]
-                assert true_tag in tag_to_neighbors
-
-                max_correct = max(max_correct, tag_to_neighbors[true_tag])
 
                 corrects = [
                     sentence_index * max_neighbor_seq_len + token_index
-                    for sentence_index, token_index in tag_to_neighbors[true_tag]
+                    for sentence_index, token_index in tag_to_neighbors[
+                        instance.tags[word_index]
+                    ]
                 ]
+                max_correct = max(max_correct, corrects)
+
                 target_indices.extend(
                     [
                         (batch_index, word_index, correct_index)
@@ -597,9 +584,7 @@ class SentDB(object):
                 targets.extend(corrects)
 
         targets = torch.sparse_coo_tensor(
-            list(zip(*target_indices)),
-            targets,
-            (end_index - start_index, max_seq_len, max_correct),
+            list(zip(*target_indices)), targets, (batch_size, max_seq_len, max_correct),
         )
 
         x_mapper_sparse = self._get_wordpiece_to_word_mapper(
@@ -608,6 +593,8 @@ class SentDB(object):
 
         neighbor_mapper_sparse = self._get_wordpiece_to_word_mapper(neighbor_indices)
 
+        ignore_index = len(neighbor_indices) * max_neighbor_seq_len
+
         batch = Batch(
             start_index,
             end_index,
@@ -615,6 +602,7 @@ class SentDB(object):
             targets,
             x_mapper_sparse,
             neighbor_mapper_sparse,
+            ignore_index,
         )
 
         return batch

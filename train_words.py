@@ -183,7 +183,10 @@ def do_fscore(sentdb, model, device, cfg):
     total_preds, total_golds, total_corrects = 0.0, 0.0, 0.0
     for step in range(len(sentdb.validation_minibatches)):
         x, neighbors, x_mapper, neigbor_mapper, tag_to_mask, golds = move_to_device(
-            sentdb.pred_batch(step, cfg.eval_num_neighbors, batch=True), device
+            sentdb.pred_batch(
+                step, num_neighbors=cfg.eval_num_neighbors, batch_prediction=True
+            ),
+            device,
         )
 
         # batch_size x seq_len x hidden_dim
@@ -224,7 +227,10 @@ def do_single_fscore(sentdb, model, device, cfg):
     for step in range(len(sentdb.validation_instances)):
 
         x, neighbors, x_mapper, neigbor_mapper, tag_to_mask, golds = move_to_device(
-            sentdb.pred_batch(step, cfg.eval_num_neighbors, batch=False), device
+            sentdb.pred_batch(
+                step, num_neighbors=cfg.eval_num_neighbors, batch_prediction=False
+            ),
+            device,
         )
 
         # 1 x seq_len x hidden_dim
