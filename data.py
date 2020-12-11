@@ -6,18 +6,18 @@ from collections import Counter, defaultdict
 from typing import Callable, Dict, List, Tuple
 
 import torch
-from pytorch_pretrained_bert.tokenization import BertTokenizer
+from transformers import PreTrainedTokenizer
 
 logger = logging.getLogger(__file__)
 
 
-EmbeddingFun: Callable[[torch.FloatTensor], torch.FloatTensor]
+EmbeddingFun = Callable[[torch.FloatTensor], torch.FloatTensor]
 
 
 @dataclasses.dataclass
 class Alignment:
-    start: int
-    end: int
+    start_index: int
+    end_index: int
 
 
 @dataclasses.dataclass
@@ -72,7 +72,9 @@ def align_wordpieces(
             word = word.lower()
 
         if buffer_str == word or buffer_str == "[UNK]":
-            results.append(Alignment(start=curr_start, end=wordpiece_index + 1))
+            results.append(
+                Alignment(start_index=curr_start, end_index=wordpiece_index + 1)
+            )
             curr_start = wordpiece_index + 1
             word_index += 1
             buffer_str = ""
@@ -89,7 +91,7 @@ class SentDB(object):
         self,
         train_sentences_file: str,
         train_tags_file: str,
-        tokenizer: BertTokenizer,
+        tokenizer: PreTrainedTokenizer,
         validation_sentences_file: str,
         validation_tags_file: str,
         lower: bool = False,
@@ -370,7 +372,7 @@ class SentDB(object):
             for neighbor_index in neighbor_indices
         )
 
-        tag_to_mask = {}
+        tag_to_mask = []
         for tag in self.tags:
             indices = tag_to_neighbors[tag]
             values = torch.ones(len(indices), dtype=torch.float)
@@ -381,7 +383,7 @@ class SentDB(object):
                 .to_dense()
                 .log()
             )
-            tag_to_mask[tag] = mask.unsqueeze(dim=1)
+            tag_to_mask.append((tag, mask.unsqueeze(dim=1)))
 
         return x, neighbors, x_mapper, neighbor_mapper, tag_to_mask, gold_tags
 

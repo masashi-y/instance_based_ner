@@ -2,13 +2,14 @@ import argparse
 import logging
 import random
 
+import hydra
 import torch
-from pytorch_pretrained_bert.modeling import BertModel
-from pytorch_pretrained_bert.optimization import BertAdam
-from pytorch_pretrained_bert.tokenization import BertTokenizer
+from omegaconf import OmegaConf
+from transformers import (AdamW, AutoModel, AutoTokenizer,
+                          get_linear_schedule_with_warmup)
 
-import data
-import eval_util
+from data import SentDB
+from eval_util import accuracy_eval, span_eval
 
 logger = logging.getLogger(__file__)
 
@@ -39,7 +40,7 @@ def move_to_device(obj, cuda_device: torch.device):
 class TagWordModel(torch.nn.Module):
     def __init__(self, bert_model, dropout):
         super().__init__()
-        self.bert = BertModel.from_pretrained(bert_model)
+        self.bert = AutoModel.from_pretrained(bert_model)
         for lay in self.bert.encoder.layer:
             lay.output.dropout.p = dropout
 
@@ -72,7 +73,7 @@ class TagWordModel(torch.nn.Module):
         return results
 
 
-def get_batch_loss(batch_representations, neighbor_representations, targets, dummy):
+def get_batch_loss(batch_representations, neighbor_representations, targets):
     """
     batch_representations - batch_size x seq_len x hidden_dim
     neighbor_representations - num_neighbors*neighbor_seq_len x hidden_dim
@@ -83,7 +84,8 @@ def get_batch_loss(batch_representations, neighbor_representations, targets, dum
     # batch_size*seq_len x num_neighbors*neighbor_seq_len
     scores = torch.log_softmax(
         torch.mm(
-            batch_representations.view(-1, hidden_size), neighbor_representations.t()
+            batch_representations.view(-1, hidden_size),
+            neighbor_representations.view(-1, hidden_size).t(),
         ),
         dim=1,
     )
@@ -106,9 +108,11 @@ def get_batch_predictions(batch_representations, neighbor_representations, tag_t
     """
     _, seq_len, hidden_size = batch_representations.size()
 
-    scores = torch.log_softmax(  # batch_size*seq_len x num_neighbors*neighbor_seq_len
+    # batch_size*seq_len x num_neighbors*neighbor_seq_len
+    scores = torch.log_softmax(
         torch.mm(
-            batch_representations.view(-1, hidden_size), neighbor_representations.t()
+            batch_representations.view(-1, hidden_size),
+            neighbor_representations.view(-1, hidden_size).t(),
         ),
         dim=1,
     )
@@ -124,14 +128,14 @@ def get_batch_predictions(batch_representations, neighbor_representations, tag_t
     return preds
 
 
-def train(sentdb, model, optim, device, cfg):
+def train(sentdb, model, optimizer, scheduler, device, cfg):
     model.train()
     total_loss, total_preds = 0.0, 0
 
     for step, batch_index in enumerate(
         torch.randperm(len(sentdb.minibatches)).tolist(), 1
     ):
-        optim.zero_grad()
+        optimizer.zero_grad()
         x, neighbors, x_mapper, neigbor_mapper, targets = move_to_device(
             sentdb.train_batch(batch_index), device
         )
@@ -149,23 +153,19 @@ def train(sentdb, model, optim, device, cfg):
                 neighbors, neigbor_mapper
             )
 
-        neighbor_representations = neighbor_representations.view(
-            -1, neighbor_representations.size(2)
-        )
-
         if cfg.cosine:
             batch_representations = torch.nn.functional.normalize(
                 batch_representations, p=2, dim=2
             )
             neighbor_representations = torch.nn.functional.normalize(
-                neighbor_representations, p=2, dim=1
+                neighbor_representations, p=2, dim=2
             )
 
-        loss = get_batch_loss(
-            batch_representations, neighbor_representations, targets, model.dummy,
-        )
+        loss = get_batch_loss(batch_representations, neighbor_representations, targets)
         loss.backward()
-        optim.step()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_norm)
+        optimizer.step()
+        scheduler.step()
 
         total_loss += loss.item()
         total_preds += x.numel().item()
@@ -194,17 +194,13 @@ def do_fscore(sentdb, model, device, cfg):
         )
         # batch_size x seq_len
         preds = get_batch_predictions(
-            batch_representations,
-            neighbor_representations.view(-1, neighbor_representations.size(2)),
-            tag_to_mask,
+            batch_representations, neighbor_representations, tag_to_mask,
         )
         if cfg.eval_accuracy:
-            batch_preds, batch_corects = eval_util.batch_acc_eval(preds, golds)
+            batch_preds, batch_corects = batch_acc_eval(preds, golds)
             batch_golds = batch_preds
         else:
-            batch_preds, batch_golds, batch_corects = eval_util.batch_span_eval(
-                preds, golds
-            )
+            batch_preds, batch_golds, batch_corects = batch_span_eval(preds, golds)
         total_preds += batch_preds
         total_golds += batch_golds
         total_corrects += batch_corects
@@ -238,19 +234,14 @@ def do_single_fscore(sentdb, model, device, cfg):
             neighbors, neigbor_mapper, shard_batch_size=cfg.pred_shard_size
         )
 
-        neighbor_representations = neighbor_representations.view(
-            -1, neighbor_representations.size(2)
-        )
-
         if cfg.cosine:
             neighbor_representations = torch.nn.functional.normalize(
-                neighbor_representations, p=2, dim=1
+                neighbor_representations, p=2, dim=2
             )
             batch_representations = torch.nn.functional.normalize(
                 batch_representations, p=2, dim=2
             )
 
-        # 1 x seq_len
         preds = get_batch_predictions(
             batch_representations, neighbor_representations, tag_to_mask
         )
@@ -295,11 +286,11 @@ def main(cfg):
     if cfg.nosplit_parenth:
         nosplits = nosplits + ("-LPR-", "-RPR-")
 
-    tokenizer = BertTokenizer.from_pretrained(
+    tokenizer = AutoTokenizer.from_pretrained(
         cfg.bert_model, do_lower_case=cfg.lower, never_split=nosplits,
     )
 
-    sentdb = data.SentDB(
+    sentdb = SentDB(
         cfg.train_words_file,
         cfg.train_tags_file,
         tokenizer,
@@ -312,7 +303,7 @@ def main(cfg):
 
     nebert = model.bert
     if cfg.zero_shot and "newne" not in cfg.just_eval:
-        nebert = BertModel.from_pretrained(cfg.bert_model).to(device)
+        nebert = AutoModel.from_pretrained(cfg.bert_model).to(device)
 
     def embedding_fun(x):
         mask = x != 0
@@ -351,7 +342,7 @@ def main(cfg):
             if "newne" in cfg.just_eval:
                 bert = model.bert
             else:
-                bert = BertModel.from_pretrained(cfg.bert_model).to(device)
+                bert = AutoModel.from_pretrained(cfg.bert_model).to(device)
             bert.eval()
 
             # note that ne_bsz and nne are just used for recomputing neighbors
@@ -376,7 +367,7 @@ def main(cfg):
             exit(0)
 
     no_decay = ["bias", "LayerNorm.bias", "LayerNorm.weight"]
-    optimizer = BertAdam(
+    optimizer = AdamW(
         [
             {
                 "params": [
@@ -396,14 +387,18 @@ def main(cfg):
             },
         ],
         lr=cfg.lr,
-        warmup=cfg.warmup_prop,
-        t_total=cfg.epochs * len(sentdb.minibatches),
-        max_grad_norm=cfg.grad_norm,
+        correct_bias=False,
+    )
+    num_training_steps = cfg.epochs * len(sentdb.minibatches)
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=int(num_training_steps * cfg.warmup_prop),
+        num_training_steps=num_training_steps,
     )
 
     best_f1 = float("inf")
     for epoch in range(cfg.epochs):
-        train_loss = train(sentdb, model, optimizer, device, cfg)
+        train_loss = train(sentdb, model, optimizer, scheduler, device, cfg)
         logger.info("Epoch {:3d} | train loss {:8.3f}".format(epoch, train_loss))
         with torch.no_grad():
             prec, rec, f1 = do_fscore(sentdb, model, device, cfg)
