@@ -106,7 +106,7 @@ def get_batch_predictions(batch_representations, neighbor_representations, tag_t
     tag_to_mask - list of (tag, mask) tuples
     returns batch_size x seq_len tag predictions
     """
-    _, seq_len, hidden_size = batch_representations.size()
+    batch_size, seq_len, hidden_size = batch_representations.size()
 
     # batch_size*seq_len x num_neighbors*neighbor_seq_len
     scores = torch.log_softmax(
@@ -137,7 +137,7 @@ def train(sentdb, model, optimizer, scheduler, device, cfg):
     ):
         optimizer.zero_grad()
         x, neighbors, x_mapper, neigbor_mapper, targets = move_to_device(
-            sentdb.train_batch(batch_index), device
+            sentdb.get_batch(batch_index), device
         )
 
         # batch_size x seq_len x hidden_dim
@@ -183,10 +183,7 @@ def do_fscore(sentdb, model, device, cfg):
     total_preds, total_golds, total_corrects = 0.0, 0.0, 0.0
     for step in range(len(sentdb.validation_minibatches)):
         x, neighbors, x_mapper, neigbor_mapper, tag_to_mask, golds = move_to_device(
-            sentdb.pred_batch(
-                step, num_neighbors=cfg.eval_num_neighbors, batch_prediction=True
-            ),
-            device,
+            sentdb.get_batch(step, batch_prediction=True), device,
         )
 
         # batch_size x seq_len x hidden_dim
@@ -200,10 +197,10 @@ def do_fscore(sentdb, model, device, cfg):
             batch_representations, neighbor_representations, tag_to_mask,
         )
         if cfg.eval_accuracy:
-            batch_preds, batch_corects = batch_acc_eval(preds, golds)
+            batch_preds, batch_corects = accuracy_eval(preds, golds)
             batch_golds = batch_preds
         else:
-            batch_preds, batch_golds, batch_corects = batch_span_eval(preds, golds)
+            batch_preds, batch_golds, batch_corects = span_eval(preds, golds)
         total_preds += batch_preds
         total_golds += batch_golds
         total_corrects += batch_corects
@@ -227,10 +224,7 @@ def do_single_fscore(sentdb, model, device, cfg):
     for step in range(len(sentdb.validation_instances)):
 
         x, neighbors, x_mapper, neigbor_mapper, tag_to_mask, golds = move_to_device(
-            sentdb.pred_batch(
-                step, num_neighbors=cfg.eval_num_neighbors, batch_prediction=False
-            ),
-            device,
+            sentdb.get_batch(step, batch_prediction=False), device,
         )
 
         # 1 x seq_len x hidden_dim
@@ -253,10 +247,10 @@ def do_single_fscore(sentdb, model, device, cfg):
         )
 
         if cfg.eval_accuracy:
-            batch_preds, batch_corrects = eval_util.batch_acc_eval(preds, golds)
+            batch_preds, batch_corrects = accuracy_eval(preds, golds)
             batch_golds = batch_preds
         else:
-            batch_preds, batch_golds, batch_corrects = eval_util.batch_span_eval(
+            batch_preds, batch_golds, batch_corrects = span_eval(
                 preds, golds
             )
 
@@ -302,6 +296,7 @@ def main(cfg):
         tokenizer,
         cfg.validation_words_file,
         cfg.validation_tags_file,
+        max_num_neighbors=cfg.neighbor_per_sent,
         lower=cfg.lower,
         align_strategy=cfg.align_strategy,
         subsample=cfg.subsample,
@@ -332,11 +327,9 @@ def main(cfg):
 
     if not cfg.zero_shot:
         sentdb.make_minibatches(
-            cfg.batch_size,
-            cfg.neighbor_per_sent,
-            random_neighbors_in_train=cfg.random_neighbors_in_train,
+            cfg.batch_size, random_neighbors_in_train=cfg.random_neighbors_in_train,
         )
-        sentdb.make_minibatches(cfg.batch_size, cfg.neighbor_per_sent, validation=True)
+        sentdb.make_minibatches(cfg.batch_size, validation=True)
         model.train()
 
     if cfg.just_eval is not None:
@@ -357,12 +350,10 @@ def main(cfg):
             sentdb.override_validation_with_test(
                 cfg.validation_words_file,
                 cfg.validation_tags_file,
-                tokenizer,
                 embedding_fun,
                 device,
                 batch_size=128,
                 topk=500,
-                lower=cfg.lower,
             )
 
         with torch.no_grad():
@@ -395,7 +386,7 @@ def main(cfg):
         lr=cfg.lr,
         correct_bias=False,
     )
-    num_training_steps = cfg.epochs * len(sentdb.minibatches)
+    num_training_steps = cfg.epochs * len(sentdb.train_minibatches)
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
         num_warmup_steps=int(num_training_steps * cfg.warmup_prop),

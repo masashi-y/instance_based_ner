@@ -1,9 +1,8 @@
 import dataclasses
 import logging
-import os
 import random
-from collections import Counter, defaultdict
-from typing import Callable, Dict, List, Tuple
+from collections import defaultdict
+from typing import Callable, Dict, List, Tuple, Iterator
 
 import torch
 from transformers import PreTrainedTokenizer
@@ -46,7 +45,6 @@ class Batch:
 class RandomBatch:
     start_index: int
     end_index: int
-    num_neighbors: int
 
 
 def align_wordpieces(
@@ -116,6 +114,7 @@ class SentDB(object):
         lower: bool = False,
         align_strategy: str = "last",
         subsample: int = 2500,
+        max_num_neighbors: int = 50,
     ):
         assert (
             align_strategy in self.align_strategy_choices
@@ -125,6 +124,7 @@ class SentDB(object):
         self.subsample = subsample
         self.tokenizer = tokenizer
         self.lower = lower
+        self.max_num_neighbors = max_num_neighbors
 
         self.train_instances = self.process_words_tags_files(
             train_sentences_file, train_tags_file
@@ -269,10 +269,9 @@ class SentDB(object):
         _, results = torch.topk(similarities, topk, dim=1)
         self.validation_top_neighbors = [row.tolist() for row in results]
 
-    def pred_batch(
+    def get_batch(
         self,
         batch_or_sent_index: int,
-        num_neighbors: Optional[int] = None,
         padding_value: int = 0,
         batch_prediction: bool = True,
         validation: bool = False,
@@ -288,13 +287,9 @@ class SentDB(object):
             if batch_prediction:
                 batch = self.validation_minibatches[batch_or_sent_index]
             else:
-                assert num_neighbors is not None
 
                 batch = self.precompute_batch(
-                    batch_or_sent_index,
-                    batch_or_sent_index + 1,
-                    num_neighbors,
-                    validation=True,
+                    batch_or_sent_index, batch_or_sent_index + 1, validation=True,
                 )
         else:
             instances = self.train_instances
@@ -305,7 +300,6 @@ class SentDB(object):
                 batch = self.precompute_batch(
                     batch.start_index,
                     batch.end_index,
-                    batch.num_neighbors,
                     random_neighbors=True,
                     validation=False,
                 )
@@ -332,7 +326,7 @@ class SentDB(object):
         x_mapper = batch.x_mapper_sparse.to_dense()
         neighbor_mapper = batch.neighbor_mapper_sparse.to_dense()
 
-        if train:
+        if not validation:
 
             sparse_targets = batch.targets
             mask = (
@@ -411,7 +405,6 @@ class SentDB(object):
         self,
         start_index: int,
         end_index: int,
-        num_neighbors: int,
         random_neighbors: bool = False,
         validation: bool = False,
     ) -> List[int]:
@@ -425,8 +418,8 @@ class SentDB(object):
 
         def sample(neighbors):
             if random_neighbors:
-                return random.sample(neighbors, num_neighbors)
-            return neighbors[:num_neighbors]
+                return random.sample(neighbors, self.max_num_neighbors)
+            return neighbors[: self.max_num_neighbors]
 
         neighbor_indices = [
             neighbor_index
@@ -459,7 +452,6 @@ class SentDB(object):
     def make_minibatches(
         self,
         batch_size: int,
-        num_neighbors: int,
         random_neighbors_in_train: bool = False,
         validation: bool = False,
     ):
@@ -472,10 +464,10 @@ class SentDB(object):
         minibatches = []
         for _, (start_index, end_index) in _iter_minibatches(instances, batch_size):
             if random_neighbors_in_train:
-                batch = RandomBatch(start_index, end_index, num_neighbors)
+                batch = RandomBatch(start_index, end_index)
             else:
                 batch = self.precompute_batch(
-                    start_index, end_index, num_neighbors, validation=validation,
+                    start_index, end_index, validation=validation,
                 )
             minibatches.append(batch)
 
@@ -534,10 +526,9 @@ class SentDB(object):
         self,
         start_index: int,
         end_index: int,
-        num_neighbors: int,
         random_neighbors: bool = False,
         validation: bool = False,
-    ):
+    ) -> Batch:
         if validation:
             instances = self.validation_instances
         else:
@@ -546,7 +537,6 @@ class SentDB(object):
         neighbor_indices = self._compute_neighbor_indices(
             start_index,
             end_index,
-            num_neighbors=num_neighbors,
             random_neighbors=random_neighbors,
             validation=validation,
         )
