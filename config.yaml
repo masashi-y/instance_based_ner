@@ -2,14 +2,14 @@
 # "bert-base-uncased", "bert-large-uncased", "bert-base-cased"
 bert_model: "bert-base-cased"
 lower: false
-train_words_file: "data/conll2003/conll2003-dev.words"
-train_tags_file: "data/conll2003/conll2003-dev.nertags"
-validation_words_file: "data/conll2003/conll2003-dev.words"
-validation_tags_file: "data/conll2003/conll2003-dev.nertags"
+validation_data: "dev"
+pretrained: null
+topk: 500
 
-batch_size: 16
+preprocess_batch_size: 128
+train_batch_size: 16
 seed: 3435
-cuda: true
+cuda: -1
 nosplit_parenth: false
 
 lr: 5e-5
@@ -20,7 +20,7 @@ epochs: 10
 log_interval: 100
 save: null
 
-neighbor_per_sent: 50
+max_num_neighbors: 50
 random_neighbors_in_train: true
 eval_num_neighbors: 100
 eval_accuracy: false
@@ -32,5 +32,6 @@ align_strategy: "first"  #"sum", "first", "last"
 detach_db: false
 subsample: 2500
 
-just_eval: null   # "dev", "dev-newne"
+# just_eval: null   # "dev", "dev-finetuned"
+eval: false
 zero_shot: false

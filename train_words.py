@@ -1,4 +1,3 @@
-import argparse
 import logging
 import random
 
@@ -8,7 +7,7 @@ from omegaconf import OmegaConf
 from transformers import (AdamW, AutoModel, AutoTokenizer,
                           get_linear_schedule_with_warmup)
 
-from data import SentDB
+from data import CoNLL2003Dataset
 from eval_util import accuracy_eval, span_eval
 
 logger = logging.getLogger(__file__)
@@ -37,12 +36,14 @@ def move_to_device(obj, cuda_device: torch.device):
         return obj
 
 
-class TagWordModel(torch.nn.Module):
-    def __init__(self, bert_model, dropout):
+class Model(torch.nn.Module):
+    def __init__(self, bert_model_name: str, dropout: float):
         super().__init__()
-        self.bert = AutoModel.from_pretrained(bert_model)
-        for lay in self.bert.encoder.layer:
-            lay.output.dropout.p = dropout
+        self.bert = AutoModel.from_pretrained(
+            bert_model_name,
+            hidden_dropout_prob=dropout,
+            attention_probs_dropout_prob=dropout,
+        )
 
     def get_word_representations(self, x, mapper, shard_batch_size=None):
         """
@@ -66,7 +67,8 @@ class TagWordModel(torch.nn.Module):
         mask = (x != 0).long()
 
         # batch_size x seq_len x hidden_dim
-        bertrep, _ = self.bert(x, attention_mask=mask, output_all_encoded_layers=False)
+        bertrep, _ = self.bert(x, attention_mask=mask)
+
         # get word reps by selecting or adding pieces
         # batch_size x seq_len x hidden_dim
         results = torch.bmm(mapper, bertrep)
@@ -92,9 +94,8 @@ def get_batch_loss(batch_representations, neighbor_representations, targets):
 
     dummy = torch.full(scores.size(0), 1, fill_value=float("-inf"))
     scores = torch.cat([scores, dummy], dim=1)
-    target_scores = scores.gather(
-        1, targets.view(scores.size(0), -1)
-    )  # batch_size x max_correct
+    # batch_size x max_correct
+    target_scores = scores.gather(1, targets.view(scores.size(0), -1))
     loss = -torch.logsumexp(target_scores, dim=1)
     return loss
 
@@ -128,17 +129,13 @@ def get_batch_predictions(batch_representations, neighbor_representations, tag_t
     return preds
 
 
-def train(sentdb, model, optimizer, scheduler, device, cfg):
+def train(dataset, model, optimizer, scheduler, device, cfg):
     model.train()
     total_loss, total_preds = 0.0, 0
 
-    for step, batch_index in enumerate(
-        torch.randperm(len(sentdb.minibatches)).tolist(), 1
-    ):
+    for step, batch in enumerate(dataset.iter_batches(shuffle=True), 1):
         optimizer.zero_grad()
-        x, neighbors, x_mapper, neigbor_mapper, targets = move_to_device(
-            sentdb.get_batch(batch_index), device
-        )
+        x, neighbors, x_mapper, neigbor_mapper, targets = move_to_device(batch, device)
 
         # batch_size x seq_len x hidden_dim
         batch_representations = model.get_word_representations(x, x_mapper)
@@ -174,16 +171,20 @@ def train(sentdb, model, optimizer, scheduler, device, cfg):
     return total_loss / total_preds
 
 
-def do_fscore(sentdb, model, device, cfg):
+def do_fscore(dataset, model, device, cfg, single_prediction=False):
     """
-    micro-avgd segment-level f1-score
+    micro-averaged segment-level f1-score
+
+    single_prediction: the point of this is so we don't mix neighbors
+    based on other stuff in the minibatch
     """
 
     model.eval()
     total_preds, total_golds, total_corrects = 0.0, 0.0, 0.0
-    for step in range(len(sentdb.validation_minibatches)):
+    logger.info("predicting on %d sentences", len(dataset.instances))
+    for batch in dataset.iter_batches(single_prediction=single_prediction):
         x, neighbors, x_mapper, neigbor_mapper, tag_to_mask, golds = move_to_device(
-            sentdb.get_batch(step, batch_prediction=True), device,
+            batch, device,
         )
 
         # batch_size x seq_len x hidden_dim
@@ -211,59 +212,6 @@ def do_fscore(sentdb, model, device, cfg):
     return micro_prec, micro_rec, micro_f1
 
 
-def do_single_fscore(sentdb, model, device, cfg):
-    """
-    micro-averaged segment-level f1-score
-    the point of this is so we don't mix neighbors
-    based on other stuff in the minibatch
-    """
-
-    model.eval()
-    total_preds, total_golds, total_correct = 0.0, 0.0, 0.0
-    logger.info("predicting on %d sentences", len(sentdb.validation_instances))
-    for step in range(len(sentdb.validation_instances)):
-
-        x, neighbors, x_mapper, neigbor_mapper, tag_to_mask, golds = move_to_device(
-            sentdb.get_batch(step, batch_prediction=False), device,
-        )
-
-        # 1 x seq_len x hidden_dim
-        batch_representations = model.get_word_representations(x, x_mapper)
-        # num_neighbors x neighbor_seq_len x hidden_dim
-        neighbor_representations = model.get_word_representations(
-            neighbors, neigbor_mapper, shard_batch_size=cfg.pred_shard_size
-        )
-
-        if cfg.cosine:
-            neighbor_representations = torch.nn.functional.normalize(
-                neighbor_representations, p=2, dim=2
-            )
-            batch_representations = torch.nn.functional.normalize(
-                batch_representations, p=2, dim=2
-            )
-
-        preds = get_batch_predictions(
-            batch_representations, neighbor_representations, tag_to_mask
-        )
-
-        if cfg.eval_accuracy:
-            batch_preds, batch_corrects = accuracy_eval(preds, golds)
-            batch_golds = batch_preds
-        else:
-            batch_preds, batch_golds, batch_corrects = span_eval(
-                preds, golds
-            )
-
-        total_preds += batch_preds
-        total_golds += batch_golds
-        total_correct += batch_corrects
-
-    micro_prec = total_correct / total_preds if total_preds > 0 else 0
-    micro_rec = total_correct / total_golds if total_golds > 0 else 0
-    micro_f1 = 2 * micro_prec * micro_rec / (micro_prec + micro_rec)
-    return micro_prec, micro_rec, micro_f1
-
-
 @hydra.main(config_name="config")
 def main(cfg):
     logger.info(OmegaConf.to_yaml(cfg))
@@ -272,15 +220,17 @@ def main(cfg):
     torch.manual_seed(cfg.seed)
     random.seed(cfg.seed)
 
-    assert not cfg.zero_shot or cfg.just_eval is not None
-
-    if torch.cuda.is_available() and not cfg.cuda:
-        logger.info(
-            "WARNING: You have a CUDA device, so you should probably run with --cuda"
+    if torch.cuda.is_available() and cfg.cuda < 0:
+        logger.warning(
+            "WARNING: You have a CUDA device, so you should probably run with `cuda` option"
         )
 
-    device = torch.device("cuda" if cfg.cuda else "cpu")
-    model = TagWordModel(cfg.bert_model, cfg.dropout).to(device)
+    device = torch.device(f"cuda:{cfg.cuda}" if cfg.cuda > -1 else "cpu")
+
+    model = Model(cfg.bert_model, cfg.dropout).to(device)
+    if cfg.pretrained is not None:
+        logger.info("loading model from %s", cfg.pretrained)
+        model.load_state_dict(torch.load(cfg.pretrained, map_location=device))
 
     nosplits = ("[UNK]", "[SEP]", "[PAD]", "[CLS]", "[MASK]")
     if cfg.nosplit_parenth:
@@ -290,123 +240,96 @@ def main(cfg):
         cfg.bert_model, do_lower_case=cfg.lower, never_split=nosplits,
     )
 
-    sentdb = SentDB(
-        cfg.train_words_file,
-        cfg.train_tags_file,
-        tokenizer,
-        cfg.validation_words_file,
-        cfg.validation_tags_file,
-        max_num_neighbors=cfg.neighbor_per_sent,
-        lower=cfg.lower,
-        align_strategy=cfg.align_strategy,
-        subsample=cfg.subsample,
-    )
-
-    nebert = model.bert
-    if cfg.zero_shot and "newne" not in cfg.just_eval:
-        nebert = AutoModel.from_pretrained(cfg.bert_model).to(device)
-
     def embedding_fun(x):
         mask = x != 0
-        reps, _ = nebert(x, attention_mask=mask.long(), output_all_encoded_layers=False)
+        reps, _ = model.bert(x, attention_mask=mask.long())
         mask = mask.float().unsqueeze(dim=2)
         return (reps * mask).mean(dim=1)
 
-    batch_size, topk = 64, 50  # 128, 500
+    model.eval()
+    train_dataset = CoNLL2003Dataset(
+        "train",
+        tokenizer,
+        max_num_neighbors=cfg.max_num_neighbors,
+        align_strategy=cfg.align_strategy,
+        subsample=cfg.subsample,
+        random_neighbors_in_train=cfg.random_neighbors_in_train,
+    )
+
+    train_dataset.compute_top_neighbors(
+        cfg.preprocess_batch_size, embedding_fun, cfg.topk, device, cosine=True,
+    )
+    train_dataset.make_minibatches(cfg.train_batch_size)
+
+    validation_dataset = CoNLL2003Dataset(
+        cfg.validation_data,
+        tokenizer,
+        max_num_neighbors=cfg.max_num_neighbors,
+        align_strategy=cfg.align_strategy,
+        subsample=cfg.subsample,
+        neighbor_candidate_instances=train_dataset.instances,
+    )
 
     # we always compute neighbors w/ cosine; seems to be a bit better
-    model.eval()
-    sentdb.compute_top_neighbors(
-        batch_size,
-        embedding_fun,
-        topk,
-        device,
-        cosine=True,
-        ignore_train=cfg.zero_shot,
+    validation_dataset.compute_top_neighbors(
+        cfg.preprocess_batch_size, embedding_fun, cfg.topk, device, cosine=True,
     )
+    validation_dataset.make_minibatches(cfg.train_batch_size)
 
-    if not cfg.zero_shot:
-        sentdb.make_minibatches(
-            cfg.batch_size, random_neighbors_in_train=cfg.random_neighbors_in_train,
+    if cfg.eval:
+
+        with torch.no_grad():
+            prec, rec, f1 = do_fscore(
+                validation_dataset, model, device, cfg, single_prediction=True
+            )
+            logger.info("Eval: | P: %3.5f / R: %3.5f / F: %3.5f", prec, rec, f1)
+
+    else:  # train
+
+        no_decay = ["bias", "LayerNorm.bias", "LayerNorm.weight"]
+        optimizer = AdamW(
+            [
+                {
+                    "params": [
+                        p
+                        for n, p in model.named_parameters()
+                        if not any(nd in n for nd in no_decay)
+                    ],
+                    "weight_decay": 0.01,
+                },
+                {
+                    "params": [
+                        p
+                        for n, p in model.named_parameters()
+                        if any(nd in n for nd in no_decay)
+                    ],
+                    "weight_decay": 0.0,
+                },
+            ],
+            lr=cfg.lr,
+            correct_bias=False,
         )
-        sentdb.make_minibatches(cfg.batch_size, validation=True)
-        model.train()
+        num_training_steps = cfg.epochs * len(train_dataset.minibatches)
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=int(num_training_steps * cfg.warmup_prop),
+            num_training_steps=num_training_steps,
+        )
 
-    if cfg.just_eval is not None:
-
-        if (
-            not cfg.zero_shot and cfg.just_eval != "dev"
-        ):  # if zero_shot we already did this
-            # need to recompute new neighbors
-            if "newne" in cfg.just_eval:
-                bert = model.bert
-            else:
-                bert = AutoModel.from_pretrained(cfg.bert_model).to(device)
-            bert.eval()
-
-            # note that ne_bsz and nne are just used for recomputing neighbors
-            # and for the max ne stored per sent, resp. we control how many ne
-            # are used at prediction time w/ eval_num_neighbors
-            sentdb.override_validation_with_test(
-                cfg.validation_words_file,
-                cfg.validation_tags_file,
-                embedding_fun,
-                device,
-                batch_size=128,
-                topk=500,
-            )
-
-        with torch.no_grad():
-            prec, rec, f1 = do_single_fscore(sentdb, model, device, cfg)
-            logger.info(
-                "Eval: | P: {:3.5f} / R: {:3.5f} / F: {:3.5f}".format(prec, rec, f1)
-            )
-            exit(0)
-
-    no_decay = ["bias", "LayerNorm.bias", "LayerNorm.weight"]
-    optimizer = AdamW(
-        [
-            {
-                "params": [
-                    p
-                    for n, p in model.named_parameters()
-                    if not any(nd in n for nd in no_decay)
-                ],
-                "weight_decay": 0.01,
-            },
-            {
-                "params": [
-                    p
-                    for n, p in model.named_parameters()
-                    if any(nd in n for nd in no_decay)
-                ],
-                "weight_decay": 0.0,
-            },
-        ],
-        lr=cfg.lr,
-        correct_bias=False,
-    )
-    num_training_steps = cfg.epochs * len(sentdb.train_minibatches)
-    scheduler = get_linear_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=int(num_training_steps * cfg.warmup_prop),
-        num_training_steps=num_training_steps,
-    )
-
-    best_f1 = float("inf")
-    for epoch in range(cfg.epochs):
-        train_loss = train(sentdb, model, optimizer, scheduler, device, cfg)
-        logger.info("Epoch {:3d} | train loss {:8.3f}".format(epoch, train_loss))
-        with torch.no_grad():
-            prec, rec, f1 = do_fscore(sentdb, model, device, cfg)
-            logger.info(
-                f"Epoch {epoch:3d} | P: {prec:3.5f} / R: {rec:3.5f} / F: {f1:3.5f}"
-            )
-        if f1 > best_f1:
-            best_f1 = f1
-            if cfg.save is not None:
-                logger.info("saving to %s", cfg.save)
-                torch.save({"opt": cfg, "state_dict": model.state_dict()}, cfg.save)
+        best_f1 = float("inf")
+        for epoch in range(cfg.epochs):
+            train_loss = train(train_dataset, model, optimizer, scheduler, device, cfg)
+            logger.info("Epoch %3d | train loss %8.3f", epoch, train_loss)
+            with torch.no_grad():
+                prec, rec, f1 = do_fscore(validation_dataset, model, device, cfg)
+                logger.info(
+                    "Epoch %3d | P: %3.5f / R: %3.5f / F: %3.5f", epoch, prec, rec, f1
+                )
+            if f1 > best_f1:
+                best_f1 = f1
+                if cfg.save is not None:
+                    logger.info("saving to %s", cfg.save)
+                    torch.save(model.state_dict(), cfg.save)
 
 
 if __name__ == "__main__":
