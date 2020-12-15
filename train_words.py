@@ -281,16 +281,12 @@ def main(cfg):
     )
 
     # set batch size = 1 for evaluation, not to share neighbors within a batch
-    validation_dataset.make_minibatches(
-       1 if cfg.eval_only else cfg.train_batch_size
-   )
+    validation_dataset.make_minibatches(1 if cfg.eval_only else cfg.train_batch_size)
 
     if cfg.eval_only:
 
         with torch.no_grad():
-            prec, rec, f1 = evaluate(
-                validation_dataset, model, device, cfg
-            )
+            prec, rec, f1 = evaluate(validation_dataset, model, device, cfg)
             logger.info("Eval: | P: %3.5f / R: %3.5f / F: %3.5f", prec, rec, f1)
 
     else:  # train

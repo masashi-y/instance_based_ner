@@ -2,7 +2,8 @@ import logging
 import random
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Callable, Dict, Iterator, List, Optional, Tuple, Union, Iterable
+from typing import (Callable, Dict, Iterable, Iterator, List, Optional, Tuple,
+                    Union)
 
 import torch
 from datasets import load_dataset
@@ -176,9 +177,7 @@ class CoNLL2003Dataset(object):
         elif isinstance(split, Iterable):
             assert len(split) == 2
         else:
-            raise AssertionError(
-                f"invalid type for split argument: {split}"
-            )
+            raise AssertionError(f"invalid type for split argument: {split}")
 
         assert tag_type in ["ner_tags", "pos_tags", "chunk_tags"]
 
@@ -232,6 +231,7 @@ class CoNLL2003Dataset(object):
 
         if isinstance(split, str):
             dataset = load_dataset("conll2003", split=split)
+
             def _iter():
                 for sample in dataset:
                     tags = [
@@ -239,8 +239,10 @@ class CoNLL2003Dataset(object):
                         for tag_id in sample[tag_type]
                     ]
                     yield sample["tokens"], tags
+
         else:
             word_file, tag_file = split
+
             def _iter():
                 with open(word_file) as f1, open(tag_file) as f2:
                     for words, tags in zip(f1, f2):
@@ -310,9 +312,7 @@ class CoNLL2003Dataset(object):
         self.top_neighbors = [row.tolist() for row in results]
 
     def iter_batches(
-        self,
-        shuffle: bool = False,
-        padding_value: int = 0,
+        self, shuffle: bool = False, padding_value: int = 0,
     ):
         steps = list(range(len(self.minibatches)))
 
@@ -323,9 +323,7 @@ class CoNLL2003Dataset(object):
             yield self.get_batch(step, padding_value=padding_value)
 
     def get_batch(
-        self,
-        batch_index: int,
-        padding_value: int = 0,
+        self, batch_index: int, padding_value: int = 0,
     ):
         """
         make a validation minibatch for actually predicting.
@@ -490,9 +488,7 @@ class CoNLL2003Dataset(object):
 
         batch_size = end_index - start_index
         max_seq_len = max(len(instance) for instance in instances)
-        max_neighbor_seq_len = max(
-            len(instance) for instance in neighbor_instances
-        )
+        max_neighbor_seq_len = max(len(instance) for instance in neighbor_instances)
 
         targets, target_indices = [], []
         max_correct = 0
