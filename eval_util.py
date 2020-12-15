@@ -1,12 +1,7 @@
-from dataclasses import dataclass
 from typing import List, Set, Tuple
 
 
-@dataclass
-class Span:
-    start: int
-    end: int
-    tag: str
+Span = Tuple[int, int, str]
 
 
 # much of this adapted from https://github.com/iesl/dilated-cnn-ner/blob/08abe11aa8ecfd6eb499b959b5386f2d8ca0602e/src/eval_f1.py
@@ -34,15 +29,15 @@ def get_spans(tags: List[str]) -> Set[Span]:
 
         if is_seg_start(curr, prev):
             if in_span is not None:
-                results.add(Span(in_span, index, span_type))
+                results.add((in_span, index, span_type))
             in_span, span_type = index, curr[2:]
         elif not is_continue(curr):
             if in_span is not None:
-                results.add(Span(in_span, index, span_type))
+                results.add((in_span, index, span_type))
             in_span, span_type = None, None
 
     if in_span is not None:
-        results.add(Span(in_span, len(tags) - 1, span_type))
+        results.add((in_span, len(tags) - 1, span_type))
     return results
 
 

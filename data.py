@@ -2,7 +2,7 @@ import logging
 import random
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Callable, Dict, Iterator, List, Optional, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Tuple, Union, Iterable
 
 import torch
 from datasets import load_dataset
@@ -13,18 +13,14 @@ logger = logging.getLogger(__file__)
 
 EmbeddingFun = Callable[[torch.FloatTensor], torch.FloatTensor]
 
-
-@dataclass
-class Alignment:
-    start_index: int
-    end_index: int
+Alignment = Tuple[int, int]
 
 
 @dataclass
 class Instance:
     words: List[str]
     alignments: List[Alignment]
-    wordpieces: List[int]
+    wordpiece_ids: List[int]
     tags: List[str]
 
     def __len__(self):
@@ -58,7 +54,7 @@ def align_wordpieces(
     curr_start, word_index = 1, 0  # start at 1, b/c of CLS
     buffer_str = ""
     for wordpiece_index, wordpiece in enumerate(
-        wordpieces[1:-1], 1
+        wordpieces, 1
     ):  # ignore [SEP] final token
 
         if wordpiece.startswith("##"):
@@ -71,9 +67,7 @@ def align_wordpieces(
             word = word.lower()
 
         if buffer_str == word or buffer_str == "[UNK]":
-            results.append(
-                Alignment(start_index=curr_start, end_index=wordpiece_index + 1)
-            )
+            results.append((curr_start, wordpiece_index + 1))
             curr_start = wordpiece_index + 1
             word_index += 1
             buffer_str = ""
@@ -89,19 +83,18 @@ def _iter_minibatches(
     curr_len = len(instances[0])
     start = 0
     for batch_index, instance in enumerate(instances):
+        buffer_.append(instance)
         if len(instance) != curr_len or batch_index - start == batch_size:
             yield buffer_, (start, batch_index)
             buffer_ = []
             curr_len = len(instance)
             start = batch_index
-        else:
-            buffer_.append(instance)
-    if buffer_:
+    if len(buffer_) > 0:
         yield buffer_, (start, len(instances))
 
 
 def _get_wordpiece_to_word_mapper(
-    batch_instances: List[Instance], align_strategy: str = "first",
+    batch_instances: List[Instance], wordpiece_word_mapping: str = "first",
 ) -> torch.sparse.LongTensor:
     """
     calculate word to word piece alignment for everybody:
@@ -111,33 +104,33 @@ def _get_wordpiece_to_word_mapper(
 
     indices = []
     for batch_index, instance in enumerate(batch_instances):
-        for word_index, (first_wordpiece_index, last_wordpiece_index) in enumerate(
+        for word_index, (start_wordpiece_index, end_wordpiece_index) in enumerate(
             instance.alignments
         ):
 
-            if align_strategy == "sum":
+            if wordpiece_word_mapping == "sum":
                 indices.extend(
                     [
                         (batch_index, word_index, wordpiece_index)
                         for wordpiece_index in range(
-                            first_wordpiece_index, last_wordpiece_index
+                            start_wordpiece_index, end_wordpiece_index
                         )
                     ]
                 )
-            elif align_strategy == "first":
-                indices.append((batch_index, word_index, first_wordpiece_index))
-            elif align_strategy == "last":
-                indices.append((batch_index, word_index, last_wordpiece_index - 1))
+            elif wordpiece_word_mapping == "first":
+                indices.append((batch_index, word_index, start_wordpiece_index))
+            elif wordpiece_word_mapping == "last":
+                indices.append((batch_index, word_index, end_wordpiece_index - 1))
             else:
                 raise KeyError(
-                    f'alignment strategy "{align_strategy}" is not supported'
+                    f'alignment strategy "{wordpiece_word_mapping}" is not supported'
                 )
 
     batch_size = len(batch_instances)
-    max_wordpieces = max(len(instance.wordpieces) for instance in batch_instances)
+    max_wordpieces = max(len(instance.wordpiece_ids) for instance in batch_instances)
     max_words = max(len(instance) for instance in batch_instances)
 
-    values = torch.ones(len(indices), dtype=torch.long)
+    values = torch.ones(len(indices), dtype=torch.float)
     return torch.sparse_coo_tensor(
         list(zip(*indices)), values, (batch_size, max_words, max_wordpieces)
     )
@@ -154,7 +147,7 @@ def get_all_embeddings(
     for batch_instances, _ in _iter_minibatches(instances, batch_size):
         # batch_size x max_wordpieces
         batch = torch.nn.utils.rnn.pad_sequence(
-            [torch.LongTensor(instance.wordpieces) for instance in batch_instances],
+            [torch.LongTensor(instance.wordpiece_ids) for instance in batch_instances],
             padding_value=0,
             batch_first=True,
         )
@@ -168,37 +161,47 @@ class CoNLL2003Dataset(object):
 
     def __init__(
         self,
-        split: str,
+        split: Union[str, List[str]],
         tokenizer: PreTrainedTokenizer,
-        align_strategy: str = "last",
-        subsample: int = 2500,
-        max_num_neighbors: int = 50,
+        wordpiece_word_mapping: str = "last",
+        max_num_neighbor_tokens: int = 2500,
+        max_num_neighbor_sentences: int = 50,
         neighbor_candidate_instances: Optional[List[Instance]] = None,
         random_neighbors_in_train: bool = False,
+        validation: bool = False,
+        tag_type: str = "ner_tags",
     ):
+        if isinstance(split, str):
+            assert split in ["train", "validation", "test"]
+        elif isinstance(split, Iterable):
+            assert len(split) == 2
+        else:
+            raise AssertionError(
+                f"invalid type for split argument: {split}"
+            )
 
-        assert split in ["train", "dev", "test"]
+        assert tag_type in ["ner_tags", "pos_tags", "chunk_tags"]
 
-        self.validation = split != "train"
         assert (
-            align_strategy in self.align_strategy_choices
-        ), f"unsupported alignment strategy: {align_strategy}"
+            wordpiece_word_mapping in self.align_strategy_choices
+        ), f"unsupported alignment strategy: {wordpiece_word_mapping}"
 
         assert not (
-            self.validation and random_neighbors_in_train
+            validation and random_neighbors_in_train
         ), "`random_neighbors_in_train` can not be set True on validation set"
 
         assert (
-            not self.validation or neighbor_candidate_instances is not None
+            not validation or neighbor_candidate_instances is not None
         ), "`neighbor_candidate_instances` must be set on validation set"
 
-        self.align_strategy = align_strategy
-        self.subsample = subsample
         self.tokenizer = tokenizer
-        self.max_num_neighbors = max_num_neighbors
+        self.wordpiece_word_mapping = wordpiece_word_mapping
+        self.max_num_neighbor_tokens = max_num_neighbor_tokens
+        self.max_num_neighbor_sentences = max_num_neighbor_sentences
         self.random_neighbors_in_train = random_neighbors_in_train
+        self.validation = validation
 
-        self.instances = self._load_dataset(split)
+        self.instances = self._load_dataset(split, tag_type)
 
         if self.validation:
             self.neighbor_candidate_instances = neighbor_candidate_instances
@@ -225,28 +228,38 @@ class CoNLL2003Dataset(object):
             return 0
         return len(self.minibatches)
 
-    def _load_dataset(self, split: str) -> List[Instance]:
+    def _load_dataset(self, split: str, tag_type: str) -> List[Instance]:
 
-        dataset = load_dataset("conll2003", split=split)
+        if isinstance(split, str):
+            dataset = load_dataset("conll2003", split=split)
+            def _iter():
+                for sample in dataset:
+                    tags = [
+                        dataset.features[tag_type].feature.int2str(tag_id)
+                        for tag_id in sample[tag_type]
+                    ]
+                    yield sample["tokens"], tags
+        else:
+            word_file, tag_file = split
+            def _iter():
+                with open(word_file) as f1, open(tag_file) as f2:
+                    for words, tags in zip(f1, f2):
+                        yield words.strip().split(), tags.strip().split()
+
         results = []
-        for sample in dataset:
-            words = sample["tokens"]
-            tags = [
-                dataset.features["ner_tags"].feature.int2str(tag_id)
-                for tag_id in sample["ner_tags"]
-            ]
-            wordpieces = (
-                ["[CLS]"] + self.tokenizer.tokenize(" ".join(words)) + ["[SEP]"]
-            )
+        for words, tags in _iter():
+            wordpieces = self.tokenizer.tokenize(" ".join(words))
             alignments = align_wordpieces(
                 words, wordpieces, lower=self.tokenizer.do_lower_case
             )
-            wordpiece_indices = self.tokenizer.convert_tokens_to_ids(wordpieces)
+            wordpiece_indices = self.tokenizer.build_inputs_with_special_tokens(
+                self.tokenizer.convert_tokens_to_ids(wordpieces)
+            )
             results.append(
                 Instance(
                     words=words,
                     alignments=alignments,
-                    wordpieces=wordpiece_indices,
+                    wordpiece_ids=wordpiece_indices,
                     tags=tags,
                 )
             )
@@ -256,11 +269,12 @@ class CoNLL2003Dataset(object):
         results.sort(key=lambda instance: len(instance))
         return results
 
+    @torch.no_grad()
     def compute_top_neighbors(
         self,
         batch_size: int,
-        embedding_fun: EmbeddingFun,
         topk: int,
+        embedding_fun: EmbeddingFun,
         device: torch.device,
         cosine: bool = True,
     ) -> None:
@@ -284,41 +298,34 @@ class CoNLL2003Dataset(object):
                 candidates_embeddings = torch.nn.functional.normalize(
                     candidates_embeddings, p=2, dim=1
                 )
+            similarities = instances_embeddings.mm(candidates_embeddings.t())
+
         else:
-            candidates_embeddings = instances_embeddings
+            similarities = instances_embeddings.mm(instances_embeddings.t())
+            similarities[
+                torch.eye(similarities.size(0), dtype=torch.bool)
+            ] = 0.0  # set diagonal to zero
 
-        similarities = instances_embeddings.mm(candidates_embeddings.t())
-        similarities[
-            torch.eye(similarities.size(0), dtype=torch.bool)
-        ] = 0.0  # set diagonal to zero
-
-        _, results = torch.topk(similarities, topk, dim=1)
+        _, results = torch.topk(similarities, k=topk, dim=1)
         self.top_neighbors = [row.tolist() for row in results]
 
     def iter_batches(
         self,
         shuffle: bool = False,
         padding_value: int = 0,
-        sinple_prediction: bool = False,
     ):
-        if sinple_prediction:
-            steps = list(range(len(self.minibatches)))
-        else:
-            steps = list(range(len(self)))
+        steps = list(range(len(self.minibatches)))
 
         if shuffle:
             random.shuffle(steps)
 
         for step in steps:
-            yield self.get_batch(
-                step, padding_value=padding_value, sinple_prediction=sinple_prediction
-            )
+            yield self.get_batch(step, padding_value=padding_value)
 
     def get_batch(
         self,
-        batch_or_sent_index: int,
+        batch_index: int,
         padding_value: int = 0,
-        sinple_prediction: bool = False,
     ):
         """
         make a validation minibatch for actually predicting.
@@ -326,14 +333,9 @@ class CoNLL2003Dataset(object):
         """
 
         if self.validation:
-            if not sinple_prediction:
-                batch = self.minibatches[batch_or_sent_index]
-            else:
-                batch = self._compute_batch(
-                    batch_or_sent_index, batch_or_sent_index + 1
-                )
+            batch = self.minibatches[batch_index]
         else:
-            batch = self.minibatches[batch_or_sent_index]
+            batch = self.minibatches[batch_index]
 
             if isinstance(batch, RandomBatch):
 
@@ -343,14 +345,14 @@ class CoNLL2003Dataset(object):
 
         # batch_size x max_wordpieces
         x = torch.nn.utils.rnn.pad_sequence(
-            [torch.LongTensor(instance.wordpieces) for instance in batch.instances],
+            [torch.LongTensor(instance.wordpiece_ids) for instance in batch.instances],
             padding_value=padding_value,
             batch_first=True,
         )
 
         neighbors = torch.nn.utils.rnn.pad_sequence(
             [
-                torch.LongTensor(instance.wordpieces)
+                torch.LongTensor(instance.wordpiece_ids)
                 for instance in batch.neighbor_instances
             ],
             padding_value=padding_value,
@@ -363,6 +365,9 @@ class CoNLL2003Dataset(object):
         if not self.validation:
 
             sparse_targets = batch.targets.coalesce()
+            targets = sparse_targets.to_dense()
+            # this has to be done like this til fill value
+            # param for torch sparse tensor is implemented
             mask = (
                 torch.sparse_coo_tensor(
                     sparse_targets.indices(),
@@ -372,26 +377,24 @@ class CoNLL2003Dataset(object):
                 .to_dense()
                 .bool()
             )
-            targets = sparse_targets.to_dense()
             targets[~mask] = batch.ignore_index
 
             return x, neighbors, x_mapper, neighbor_mapper, targets
 
         gold_tags = [instance.tags for instance in batch.instances]
 
-        tag_to_neighbors = self._make_tag_to_neighbors_dict(
+        tag_to_neighbor_tokens = self._make_tag_to_neighbor_token_indices(
             batch.neighbor_instances,
-            subsample=not sinple_prediction,  # subsample when batch prediction
         )
 
         num_neighbors = len(batch.neighbor_instances)
         max_neighbor_seq_len = max(
-            len(instance.tags) for instance in batch.neighbor_instances
+            len(instance) for instance in batch.neighbor_instances
         )
 
         tag_to_mask = []
         for tag in self.tags:
-            indices = tag_to_neighbors[tag]
+            indices = tag_to_neighbor_tokens[tag]
             values = torch.ones(len(indices), dtype=torch.float)
             mask = (
                 torch.sparse_coo_tensor(
@@ -400,12 +403,12 @@ class CoNLL2003Dataset(object):
                 .to_dense()
                 .log()
             )
-            tag_to_mask.append((tag, mask.unsqueeze(dim=1)))
+            tag_to_mask.append((tag, mask.flatten().unsqueeze(dim=0)))
 
         return x, neighbors, x_mapper, neighbor_mapper, tag_to_mask, gold_tags
 
-    def _make_tag_to_neighbors_dict(
-        self, neighbor_instances: List[Instance], subsample: bool = True
+    def _make_tag_to_neighbor_token_indices(
+        self, neighbor_instances: List[Instance],
     ) -> Dict[str, List[Tuple[int, int]]]:
         """
         map each tag to location in neighbors
@@ -416,14 +419,9 @@ class CoNLL2003Dataset(object):
             for token_index, tag in enumerate(instance.tags):
                 results[tag].append((sentence_index, token_index))
 
-        if subsample:
-            keys = {"O"}
-            if self.subsample is not None:
-                keys.update(results.keys())
-
-            for key in keys:
-                if key in results and len(results[key]) > self.subsample:
-                    results[key] = random.sample(results[key], self.subsample)
+        for key in results:
+            if len(results[key]) > self.max_num_neighbor_tokens:
+                results[key] = random.sample(results[key], self.max_num_neighbor_tokens)
 
         return results
 
@@ -435,12 +433,13 @@ class CoNLL2003Dataset(object):
 
         def sample(neighbors):
             if random_neighbors:
-                return random.sample(neighbors, self.max_num_neighbors)
-            return neighbors[: self.max_num_neighbors]
+                return random.sample(neighbors, self.max_num_neighbor_sentences)
+            return neighbors[: self.max_num_neighbor_sentences]
 
         neighbor_instances = [
             self.neighbor_candidate_instances[neighbor_index]
-            for neighbor_index in sample(self.top_neighbors[start_index:end_index])
+            for instance_index in range(start_index, end_index)
+            for neighbor_index in sample(self.top_neighbors[instance_index])
             if neighbor_index not in seen_indices
         ]
 
@@ -463,6 +462,7 @@ class CoNLL2003Dataset(object):
 
         return neighbor_instances
 
+    @torch.no_grad()
     def make_minibatches(self, batch_size: int):
         self.minibatches = []
         for _, (start_index, end_index) in _iter_minibatches(
@@ -482,8 +482,8 @@ class CoNLL2003Dataset(object):
             start_index, end_index, random_neighbors=random_neighbors,
         )
 
-        tag_to_neighbors = self._make_tag_to_neighbors_dict(
-            neighbor_instances, subsample=True
+        tag_to_neighbor_tokens = self._make_tag_to_neighbor_token_indices(
+            neighbor_instances
         )
 
         instances = self.instances[start_index:end_index]
@@ -491,7 +491,7 @@ class CoNLL2003Dataset(object):
         batch_size = end_index - start_index
         max_seq_len = max(len(instance) for instance in instances)
         max_neighbor_seq_len = max(
-            len(instance.tags) for instance in neighbor_instances
+            len(instance) for instance in neighbor_instances
         )
 
         targets, target_indices = [], []
@@ -501,11 +501,11 @@ class CoNLL2003Dataset(object):
 
                 corrects = [
                     sentence_index * max_neighbor_seq_len + token_index
-                    for sentence_index, token_index in tag_to_neighbors[
+                    for sentence_index, token_index in tag_to_neighbor_tokens[
                         instance.tags[word_index]
                     ]
                 ]
-                max_correct = max(max_correct, corrects)
+                max_correct = max(max_correct, len(corrects))
 
                 target_indices.extend(
                     [
@@ -520,11 +520,11 @@ class CoNLL2003Dataset(object):
         )
 
         x_mapper_sparse = _get_wordpiece_to_word_mapper(
-            instances, align_strategy=self.align_strategy,
+            instances, wordpiece_word_mapping=self.wordpiece_word_mapping,
         )
 
         neighbor_mapper_sparse = _get_wordpiece_to_word_mapper(
-            neighbor_instances, align_strategy=self.align_strategy,
+            neighbor_instances, wordpiece_word_mapping=self.wordpiece_word_mapping,
         )
 
         ignore_index = len(neighbor_instances) * max_neighbor_seq_len

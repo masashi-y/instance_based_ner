@@ -1,27 +1,52 @@
 Code for [Label-Agnostic Sequence Labeling by Copying Nearest Neighbors](https://www.aclweb.org/anthology/P19-1533.pdf).
 
+The code is based on [the original implementation](https://github.com/swiseman/neighbor-tagging), but modified in a way I like.
+
+The results on the NER task is not exactly the same with slightly better scores on the development set (prec. 0.94918 / rec.: 0.95880 / F1: 0.95397), but the training proceeds similarly.
+
+
+
 # Dependencies
-The code was developed and tested with pytorch-pretrained-bert 0.5.1. (So you may need to do something like `pip install pytorch-pretrained-bert==0.5.1`).
+The code is tested on Python 3.8.2 and libraries in `requirements.txt`.
 
 # Training
 To train the neighbor-based NER model, run:
 ```
-python train_words.py cuda=0 detach_db=true save=mynermodel.pt
+python train_words.py cuda=0 save=mynermodel.pt
 ```
 
-By default the above script will save a database file to the argument of `-db_fi`. Once the database file has been saved, you can rerun the above with `-load_saved_db` to avoid retokenizing everything.
+For available options, see `config.yaml` or:
+```
+python train_words.py --help
+```
 
-The other models can be trained analogously, by substituting in the correct data files in `data/`; see the options in `train_words.py`. For POS tasks, the `-acc_eval` flag should be used, and we used a batch size of 20 and a learning rate of 2E-05.
+By default, it uses the train and validation splits of CoNLL2003 downloaded using [huggingface/datasets](https://github.com/huggingface/datasets).
+
+You can specify to use test set as follows:
+```
+python train_words.py validation_split=test
+```
+
+If you have your own datasets, you can do:
+```
+python train_words.py train_split='[/path/to/train.words /path/to/train.tags]' validation_split='[/path/to/dev.words, /path/to/dev.tags]'
+```
+
+where each input file lists one example sentence/tag sequence per line.
 
 # Evaluation
 To evaluate on the development set, run:
+
 ```
-python train_words.py cuda=0 pretrained=mynermodel.pt max_num_neighbors=100 pred_shard_size=64 -just_eval dev
+python train_words.py eval=true cuda=0 trained_weights=mynermodel.pt
 ```
 
-To run evaluation with recomputed neighbors (under the fine-tuned, rather than pretrained BERT), use the option `-just_eval dev-newne`.
+You can omit `trained_weights` to use pretrained (not finetuned) contextualized embeddings e.g., BERT.
 
-You can transfer evaluation as follows:
+
+For transfer evaluation:
 ```
-python -u train_words.py -cuda -pretrained mynermodel.pt max_num_neighbors=100 pred_shard_size=64 -just_eval "dev-newne" zero_shot=true
+python train_words.py trained_weights=mynermodel.pt validation_split='[data/onto/dev.words, data/onto/dev.ner]'
 ```
+
+You can find those files in the original repo if you want:)

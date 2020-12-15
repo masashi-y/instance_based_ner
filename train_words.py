@@ -82,6 +82,7 @@ def get_batch_loss(batch_representations, neighbor_representations, targets):
     targets - batch_size x seq_len x max_correct
     """
     _, _, hidden_size = batch_representations.size()
+    device = batch_representations.device
 
     # batch_size*seq_len x num_neighbors*neighbor_seq_len
     scores = torch.log_softmax(
@@ -92,11 +93,11 @@ def get_batch_loss(batch_representations, neighbor_representations, targets):
         dim=1,
     )
 
-    dummy = torch.full(scores.size(0), 1, fill_value=float("-inf"))
+    dummy = torch.full((scores.size(0), 1), fill_value=float("-inf"), device=device)
     scores = torch.cat([scores, dummy], dim=1)
     # batch_size x max_correct
     target_scores = scores.gather(1, targets.view(scores.size(0), -1))
-    loss = -torch.logsumexp(target_scores, dim=1)
+    loss = -torch.logsumexp(target_scores, dim=1).sum()
     return loss
 
 
@@ -139,15 +140,11 @@ def train(dataset, model, optimizer, scheduler, device, cfg):
 
         # batch_size x seq_len x hidden_dim
         batch_representations = model.get_word_representations(x, x_mapper)
-        if cfg.detach_db:
-            with torch.no_grad():
-                # num_neighbors x neighbor_seq_len x hidden_dim
-                neighbor_representations = model.get_word_representations(
-                    neighbors, neigbor_mapper, shard_batch_size=cfg.pred_shard_size
-                )
-        else:
+
+        with torch.set_grad_enabled(not cfg.no_grad_through_neighbors):
+            # num_neighbors x neighbor_seq_len x hidden_dim
             neighbor_representations = model.get_word_representations(
-                neighbors, neigbor_mapper
+                neighbors, neigbor_mapper, shard_batch_size=cfg.shard_batch_size
             )
 
         if cfg.cosine:
@@ -159,30 +156,31 @@ def train(dataset, model, optimizer, scheduler, device, cfg):
             )
 
         loss = get_batch_loss(batch_representations, neighbor_representations, targets)
-        loss.backward()
+        loss.div(x.numel()).backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_norm)
         optimizer.step()
-        scheduler.step()
+        if scheduler is not None:
+            scheduler.step()
 
         total_loss += loss.item()
-        total_preds += x.numel().item()
+        total_preds += x.numel()
         if step % cfg.log_interval == 0:
             logger.info("batch %d loss: %f", step, total_loss / total_preds)
     return total_loss / total_preds
 
 
-def do_fscore(dataset, model, device, cfg, single_prediction=False):
+def evaluate(dataset, model, device, cfg):
     """
     micro-averaged segment-level f1-score
-
-    single_prediction: the point of this is so we don't mix neighbors
-    based on other stuff in the minibatch
     """
 
     model.eval()
     total_preds, total_golds, total_corrects = 0.0, 0.0, 0.0
     logger.info("predicting on %d sentences", len(dataset.instances))
-    for batch in dataset.iter_batches(single_prediction=single_prediction):
+    for step, batch in enumerate(dataset.iter_batches(), 1):
+        if step % 10 == 0:
+            logger.info("processed %d/%d batches", step, len(dataset))
+
         x, neighbors, x_mapper, neigbor_mapper, tag_to_mask, golds = move_to_device(
             batch, device,
         )
@@ -191,8 +189,17 @@ def do_fscore(dataset, model, device, cfg, single_prediction=False):
         batch_representations = model.get_word_representations(x, x_mapper)
         # num_neighbors x neighbor_seq_len x hidden_dim
         neighbor_representations = model.get_word_representations(
-            neighbors, neigbor_mapper, shard_batch_size=cfg.pred_shard_size
+            neighbors, neigbor_mapper, shard_batch_size=cfg.shard_batch_size
         )
+
+        if cfg.cosine:
+            batch_representations = torch.nn.functional.normalize(
+                batch_representations, p=2, dim=2
+            )
+            neighbor_representations = torch.nn.functional.normalize(
+                neighbor_representations, p=2, dim=2
+            )
+
         # batch_size x seq_len
         preds = get_batch_predictions(
             batch_representations, neighbor_representations, tag_to_mask,
@@ -215,7 +222,6 @@ def do_fscore(dataset, model, device, cfg, single_prediction=False):
 @hydra.main(config_name="config")
 def main(cfg):
     logger.info(OmegaConf.to_yaml(cfg))
-
     torch.set_num_threads(2)
     torch.manual_seed(cfg.seed)
     random.seed(cfg.seed)
@@ -228,16 +234,12 @@ def main(cfg):
     device = torch.device(f"cuda:{cfg.cuda}" if cfg.cuda > -1 else "cpu")
 
     model = Model(cfg.bert_model, cfg.dropout).to(device)
-    if cfg.pretrained is not None:
-        logger.info("loading model from %s", cfg.pretrained)
-        model.load_state_dict(torch.load(cfg.pretrained, map_location=device))
-
-    nosplits = ("[UNK]", "[SEP]", "[PAD]", "[CLS]", "[MASK]")
-    if cfg.nosplit_parenth:
-        nosplits = nosplits + ("-LPR-", "-RPR-")
+    if cfg.trained_weights is not None:
+        logger.info("loading model from %s", cfg.trained_weights)
+        model.load_state_dict(torch.load(cfg.trained_weights, map_location=device))
 
     tokenizer = AutoTokenizer.from_pretrained(
-        cfg.bert_model, do_lower_case=cfg.lower, never_split=nosplits,
+        cfg.bert_model, do_lower_case=cfg.lowercase, never_split=cfg.nosplits,
     )
 
     def embedding_fun(x):
@@ -246,41 +248,48 @@ def main(cfg):
         mask = mask.float().unsqueeze(dim=2)
         return (reps * mask).mean(dim=1)
 
-    model.eval()
     train_dataset = CoNLL2003Dataset(
-        "train",
+        cfg.train_split,
         tokenizer,
-        max_num_neighbors=cfg.max_num_neighbors,
-        align_strategy=cfg.align_strategy,
-        subsample=cfg.subsample,
+        max_num_neighbor_sentences=cfg.train_num_neighbor_sentences,
+        max_num_neighbor_tokens=cfg.max_num_neighbor_tokens,
         random_neighbors_in_train=cfg.random_neighbors_in_train,
+        wordpiece_word_mapping=cfg.wordpiece_word_mapping,
+        tag_type=cfg.tag_type,
     )
 
-    train_dataset.compute_top_neighbors(
-        cfg.preprocess_batch_size, embedding_fun, cfg.topk, device, cosine=True,
-    )
-    train_dataset.make_minibatches(cfg.train_batch_size)
+    if not cfg.eval_only:
+        train_dataset.compute_top_neighbors(
+            cfg.preprocess_batch_size, cfg.topk, embedding_fun, device, cosine=True,
+        )
+        train_dataset.make_minibatches(cfg.train_batch_size)
 
     validation_dataset = CoNLL2003Dataset(
-        cfg.validation_data,
+        cfg.validation_split,
         tokenizer,
-        max_num_neighbors=cfg.max_num_neighbors,
-        align_strategy=cfg.align_strategy,
-        subsample=cfg.subsample,
+        max_num_neighbor_sentences=cfg.eval_num_neighbor_sentences,
+        max_num_neighbor_tokens=cfg.max_num_neighbor_tokens,
         neighbor_candidate_instances=train_dataset.instances,
+        wordpiece_word_mapping=cfg.wordpiece_word_mapping,
+        tag_type=cfg.tag_type,
+        validation=True,
     )
 
     # we always compute neighbors w/ cosine; seems to be a bit better
     validation_dataset.compute_top_neighbors(
-        cfg.preprocess_batch_size, embedding_fun, cfg.topk, device, cosine=True,
+        cfg.preprocess_batch_size, cfg.topk, embedding_fun, device, cosine=True
     )
-    validation_dataset.make_minibatches(cfg.train_batch_size)
 
-    if cfg.eval:
+    # set batch size = 1 for evaluation, not to share neighbors within a batch
+    validation_dataset.make_minibatches(
+       1 if cfg.eval_only else cfg.train_batch_size
+   )
+
+    if cfg.eval_only:
 
         with torch.no_grad():
-            prec, rec, f1 = do_fscore(
-                validation_dataset, model, device, cfg, single_prediction=True
+            prec, rec, f1 = evaluate(
+                validation_dataset, model, device, cfg
             )
             logger.info("Eval: | P: %3.5f / R: %3.5f / F: %3.5f", prec, rec, f1)
 
@@ -309,19 +318,19 @@ def main(cfg):
             lr=cfg.lr,
             correct_bias=False,
         )
-        num_training_steps = cfg.epochs * len(train_dataset.minibatches)
+        num_training_steps = cfg.epochs * len(train_dataset)
         scheduler = get_linear_schedule_with_warmup(
             optimizer,
             num_warmup_steps=int(num_training_steps * cfg.warmup_prop),
             num_training_steps=num_training_steps,
         )
 
-        best_f1 = float("inf")
+        best_f1 = float("-inf")
         for epoch in range(cfg.epochs):
             train_loss = train(train_dataset, model, optimizer, scheduler, device, cfg)
             logger.info("Epoch %3d | train loss %8.3f", epoch, train_loss)
             with torch.no_grad():
-                prec, rec, f1 = do_fscore(validation_dataset, model, device, cfg)
+                prec, rec, f1 = evaluate(validation_dataset, model, device, cfg)
                 logger.info(
                     "Epoch %3d | P: %3.5f / R: %3.5f / F: %3.5f", epoch, prec, rec, f1
                 )

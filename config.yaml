@@ -1,37 +1,63 @@
 
-# "bert-base-uncased", "bert-large-uncased", "bert-base-cased"
+# e.g., "bert-base-uncased", "bert-large-uncased", "bert-base-cased"
 bert_model: "bert-base-cased"
-lower: false
-validation_data: "dev"
-pretrained: null
+
+# "train" "validation", "dev"
+train_split: "train"
+validation_split: "validation"
+
+# "ner_tags", "pos_tags", "chunk_tags"
+tag_type: "ner_tags"
+
+# AutoTokenizer's argument
+nosplits:
+  - "[UNK]"
+  - "[SEP]"
+  - "[PAD]"
+  - "[CLS]"
+  - "[MASK]"
+  - "-LPR-"
+  - "-RPR-"
+
+lowercase: false
+
+# pretrained weights for training/evaluation
+trained_weights: null
+
+# for searching for nearest neighbor sentence
+preprocess_batch_size: 128
+
+# for actual training
+train_batch_size: 16
+
 topk: 500
 
-preprocess_batch_size: 128
-train_batch_size: 16
 seed: 3435
 cuda: -1
-nosplit_parenth: false
 
+# training, AdamW's conf
 lr: 5e-5
 dropout: 0.1
-grad_norm: 1
+grad_norm: 1.0
 warmup_prop: 0.1
 epochs: 10
 log_interval: 100
 save: null
+no_grad_through_neighbors: true
 
-max_num_neighbors: 50
+train_num_neighbor_sentences: 50
+eval_num_neighbor_sentences: 100
 random_neighbors_in_train: true
-eval_num_neighbors: 100
+
 eval_accuracy: false
-pred_shard_size: 64
-cosine: true
 
-align_strategy: "first"  #"sum", "first", "last"
+shard_batch_size: 64
+cosine: false
 
-detach_db: false
-subsample: 2500
+# "sum", "first", "last"
+wordpiece_word_mapping: "first"
 
-# just_eval: null   # "dev", "dev-finetuned"
-eval: false
-zero_shot: false
+max_num_neighbor_tokens: 2500
+
+# perform evaluation only (with pretrain or finetuned BERT params)
+eval_only: false
