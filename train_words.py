@@ -1,4 +1,5 @@
 import logging
+import os
 import random
 
 import hydra
@@ -7,6 +8,7 @@ from omegaconf import OmegaConf
 from transformers import (AdamW, AutoModel, AutoTokenizer,
                           get_linear_schedule_with_warmup)
 
+import wandb
 from data import CoNLL2003Dataset
 from eval_util import accuracy_eval, span_eval
 
@@ -130,9 +132,10 @@ def get_batch_predictions(batch_representations, neighbor_representations, tag_t
     return preds
 
 
-def train(dataset, model, optimizer, scheduler, device, cfg):
+def train(epoch, dataset, model, optimizer, scheduler, device, cfg):
     model.train()
     total_loss, total_preds = 0.0, 0
+    wandb.watch(model, log="all", log_freq=10)
 
     for step, batch in enumerate(dataset.iter_batches(shuffle=True), 1):
         optimizer.zero_grad()
@@ -164,6 +167,8 @@ def train(dataset, model, optimizer, scheduler, device, cfg):
 
         total_loss += loss.item()
         total_preds += x.numel()
+
+        wandb.log({"epoch": epoch, "loss": loss}, step=step)
         if step % cfg.log_interval == 0:
             logger.info("batch %d loss: %f", step, total_loss / total_preds)
     return total_loss / total_preds
@@ -225,6 +230,10 @@ def main(cfg):
     torch.set_num_threads(2)
     torch.manual_seed(cfg.seed)
     random.seed(cfg.seed)
+
+    wandb.init(
+        project="instance_based_ner", config=dict(cfg),
+    )
 
     if torch.cuda.is_available() and cfg.cuda < 0:
         logger.warning(
@@ -323,18 +332,22 @@ def main(cfg):
 
         best_f1 = float("-inf")
         for epoch in range(cfg.epochs):
-            train_loss = train(train_dataset, model, optimizer, scheduler, device, cfg)
+            train_loss = train(
+                epoch, train_dataset, model, optimizer, scheduler, device, cfg
+            )
             logger.info("Epoch %3d | train loss %8.3f", epoch, train_loss)
             with torch.no_grad():
                 prec, rec, f1 = evaluate(validation_dataset, model, device, cfg)
                 logger.info(
                     "Epoch %3d | P: %3.5f / R: %3.5f / F: %3.5f", epoch, prec, rec, f1
                 )
+                wandb.log({"precision": prec, "recall": rec, "f1": f1})
             if f1 > best_f1:
                 best_f1 = f1
                 if cfg.save is not None:
                     logger.info("saving to %s", cfg.save)
                     torch.save(model.state_dict(), cfg.save)
+        torch.save(model.state_dict(), os.path.join(wandb.run.dir, "model.pt"))
 
 
 if __name__ == "__main__":
